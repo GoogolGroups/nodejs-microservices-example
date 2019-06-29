@@ -231,3 +231,10 @@ https://www.terraform.io/docs/providers/azurerm/r/kubernetes_cluster.html
 
 Great video from Scott Hanselman
 https://www.youtube.com/watch?v=iECZMWIQfgc
+
+Setting up Terraform/Kubernetes on AWS
+https://www.hashicorp.com/blog/hashicorp-announces-terraform-support-aws-kubernetes
+https://learn.hashicorp.com/terraform/aws/eks-intro
+
+Terraform AWS provider
+https://www.terraform.io/docs/providers/aws/#authentication

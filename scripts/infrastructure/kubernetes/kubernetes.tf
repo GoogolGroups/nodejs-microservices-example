@@ -1,62 +1,157 @@
-provider "azurerm" {
+# https://learn.hashicorp.com/terraform/aws/eks-intro
+
+provider "aws" {
+  region = var.aws_region
+  access_key = var.aws_access_key
+  secret_key = var.aws_secret_key
 }
 
-resource "azurerm_resource_group" "main" {
-  name     = "${var.resource_group_name}-${var.environment}"
-  location = var.location
+# This data source is included for ease of sample architecture deployment
+# and can be swapped out as necessary.
+data "aws_availability_zones" "available" {}
+
+resource "aws_vpc" "demo" {
+  cidr_block = "10.0.0.0/16"
+
+  tags = "${
+    map(
+     "Name", "terraform-eks-demo-node",
+     "kubernetes.io/cluster/${var.cluster-name}", "shared",
+    )
+  }"
 }
 
-# Generate an SSH key.
-# See video: https://channel9.msdn.com/Shows/Azure-Friday/Provisioning-Kubernetes-clusters-on-AKS-using-HashiCorp-Terraform?utm_source=newsletter&utm_medium=email&utm_campaign=Learn%20By%20Doing
-# At time: 3:15, 4:50 
-resource "tls_private_key" "key" {
-  algorithm = "RSA"
+resource "aws_subnet" "demo" {
+  count = 2
+
+  availability_zone = "${data.aws_availability_zones.available.names[count.index]}"
+  cidr_block        = "10.0.${count.index}.0/24"
+  vpc_id            = "${aws_vpc.demo.id}"
+
+  tags = "${
+    map(
+     "Name", "terraform-eks-demo-node",
+     "kubernetes.io/cluster/${var.cluster-name}", "shared",
+    )
+  }"
 }
 
-resource "azurerm_kubernetes_cluster" "main" {
-  name                = "${var.cluster_name}-${var.environment}"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-  dns_prefix          = "${var.dns_prefix}-${var.environment}"
+resource "aws_internet_gateway" "demo" {
+  vpc_id = "${aws_vpc.demo.id}"
 
-  linux_profile {
-    admin_username = var.admin_username
+  tags = {
+    Name = "terraform-eks-demo"
+  }
+}
 
-    ssh_key {
-      key_data = "${trimspace(tls_private_key.key.public_key_openssh)} ${var.admin_username}@azure.com"
+resource "aws_route_table" "demo" {
+  vpc_id = "${aws_vpc.demo.id}"
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = "${aws_internet_gateway.demo.id}"
+  }
+}
+
+resource "aws_route_table_association" "demo" {
+  count = 2
+
+  subnet_id      = "${aws_subnet.demo.*.id[count.index]}"
+  route_table_id = "${aws_route_table.demo.id}"
+}
+
+resource "aws_iam_role" "demo-cluster" {
+  name = "terraform-eks-demo-cluster"
+
+  assume_role_policy = <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
     }
-  }
+  ]
+}
+POLICY
+}
 
-  agent_pool_profile {
-    name            = "default"
-    count           = var.agent_count
-    vm_size         = "Standard_B2s"
-    os_type         = "Linux"
-    os_disk_size_gb = 30
-  }
+resource "aws_iam_role_policy_attachment" "demo-cluster-AmazonEKSClusterPolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = "${aws_iam_role.demo-cluster.name}"
+}
 
-  service_principal {
-    client_id     = var.client_id
-    client_secret = var.client_secret
+resource "aws_iam_role_policy_attachment" "demo-cluster-AmazonEKSServicePolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSServicePolicy"
+  role       = "${aws_iam_role.demo-cluster.name}"
+}
+
+resource "aws_security_group" "demo-cluster" {
+  name        = "terraform-eks-demo-cluster"
+  description = "Cluster communication with worker nodes"
+  vpc_id      = "${aws_vpc.demo.id}"
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   tags = {
-    Environment = "Production"
+    Name = "terraform-eks-demo"
   }
 }
 
-provider "kubernetes" {
-  host = azurerm_kubernetes_cluster.main.kube_config[0].host
+resource "aws_eks_cluster" "demo" {
+  name            = "${var.cluster-name}"
+  role_arn        = "${aws_iam_role.demo-cluster.arn}"
 
-  #username               = "${azurerm_kubernetes_cluster.main.kube_config.0.username}"
-  #password               = "${azurerm_kubernetes_cluster.main.kube_config.0.password}"
-  client_certificate = base64decode(
-    azurerm_kubernetes_cluster.main.kube_config[0].client_certificate,
-  )
+  vpc_config {
+    security_group_ids = ["${aws_security_group.demo-cluster.id}"]
+    subnet_ids         = "${aws_subnet.demo.*.id}"
+  }
 
-  client_key = base64decode(azurerm_kubernetes_cluster.main.kube_config[0].client_key)
-  cluster_ca_certificate = base64decode(
-    azurerm_kubernetes_cluster.main.kube_config[0].cluster_ca_certificate,
-  )
+  depends_on = [
+    "aws_iam_role_policy_attachment.demo-cluster-AmazonEKSClusterPolicy",
+    "aws_iam_role_policy_attachment.demo-cluster-AmazonEKSServicePolicy",
+  ]
 }
 
+locals {
+  kubeconfig = <<KUBECONFIG
+
+
+apiVersion: v1
+clusters:
+- cluster:
+    server: ${aws_eks_cluster.demo.endpoint}
+    certificate-authority-data: ${aws_eks_cluster.demo.certificate_authority.0.data}
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: aws
+  name: aws
+current-context: aws
+kind: Config
+preferences: {}
+users:
+- name: aws
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1alpha1
+      command: aws-iam-authenticator
+      args:
+        - "token"
+        - "-i"
+        - "${var.cluster-name}"
+KUBECONFIG
+}
+
+output "kubeconfig" {
+  value = "${local.kubeconfig}"
+}

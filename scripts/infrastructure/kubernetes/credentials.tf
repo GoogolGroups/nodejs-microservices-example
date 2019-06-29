@@ -1,6 +1,5 @@
-variable "client_id" {
+variable "aws_access_key" {
 }
 
-variable "client_secret" {
+variable "aws_secret_key" {
 }
-
